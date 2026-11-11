@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 ALLOW, ASK, BLOCK = "allow", "ask", "block"
 RANK = {ALLOW: 0, ASK: 1, BLOCK: 2}
@@ -116,7 +116,7 @@ def _rm_verdict(cmd):
 def _load_config(cwd=None):
     """Optional .seatbelt.json in the project or home dir:
     {"allow": ["regex"], "ask": ["regex"], "block": ["regex"]}"""
-    cfg = {"allow": [], "ask": [], "block": []}
+    cfg = {"allow": [], "ask": [], "block": [], "mode": "enforce"}
     paths = [os.path.expanduser("~/.seatbelt.json")]
     if cwd:
         paths.append(os.path.join(cwd, ".seatbelt.json"))
@@ -124,15 +124,59 @@ def _load_config(cwd=None):
         try:
             with open(p) as f:
                 data = json.load(f)
-            for k in cfg:
+            for k in ("allow", "ask", "block"):
                 cfg[k] += list(data.get(k, []))
+            if data.get("mode") in ("enforce", "shadow"):
+                cfg["mode"] = data["mode"]
         except (OSError, ValueError):
             pass
+    if os.environ.get("SEATBELT_MODE") in ("enforce", "shadow"):
+        cfg["mode"] = os.environ["SEATBELT_MODE"]
     return cfg
 
 
 SHELLS = r"(?:ba|z|da|k|fi)?sh"
 SCRIPT_MAX = 256 * 1024
+
+# ---- files that keep Seatbelt itself switched on: an agent must not edit them silently
+PROTECTED = re.compile(r"(^|/)\.claude/settings(\.local)?\.json$|(^|/)\.seatbelt\.json$|(^|/)seatbelt\.py$|(^|/)\.seatbelt/")
+PROTECTED_IN_CMD = re.compile(r"\.claude/settings(\.local)?\.json|\.seatbelt\.json|\bseatbelt\.py\b|\.seatbelt/")
+READ_ONLY_CMD = re.compile(r"^\s*(cat|less|more|head|tail|bat|grep|rg|ls|stat|wc|diff|git\s+(diff|status|log|show)|jq\s+[^>]*$)\b")
+
+# ---- interpreter one-liners: python -c, node -e, ruby -e, perl -e, php -r, deno eval, bun -e
+INTERP = re.compile(r"\b(python[0-9.]*|node|nodejs|ruby|perl|php|deno\s+eval|bun)\s+(?:-\w+\s+)*?(-c|-e|-r|--eval|eval)\s+(\"(?:[^\"\\]|\\.)*\"|'[^']*')|\bdeno\s+eval\s+(\"(?:[^\"\\]|\\.)*\"|'[^']*')")
+DELETE_API = re.compile(r"shutil\.rmtree|os\.(remove|unlink|rmdir|removedirs)\b|\.unlink\(|\.rmdir\(|send2trash|"
+                        r"fs\.(rmSync|rm|rmdirSync|rmdir|unlinkSync|unlink)\b|\.(rmSync|rmdirSync|unlinkSync)\(|rimraf|"
+                        r"FileUtils\.(rm_rf|rm_r|remove_dir|rm)|File\.delete|Dir\.delete|\brmtree\b|\bunlink\s*\(|\bunlink\b|\brmdir\b")
+DANGER_ARG = re.compile(r"(['\"])(/|~|~/|/home/?|/root/?|/etc/?|/usr/?|/var/?|\.|\./|\$HOME)\1|expanduser\(\s*['\"]~|Path\.home\(\)|os\.homedir\(\)|"
+                        r"environ\[['\"]HOME['\"]\]|getenv\(['\"]HOME['\"]\)|ENV\[['\"]HOME['\"]\]|process\.env\.HOME")
+
+
+def _interp_verdicts(cmd, cwd, depth):
+    hits = []
+    for m in INTERP.finditer(cmd):
+        code = m.group(3) or m.group(4) or ""
+        code = code[1:-1]
+        if DELETE_API.search(code):
+            if DANGER_ARG.search(code):
+                hits.append(("interp-delete-root", BLOCK, "A script one-liner deletes the root or home directory."))
+            else:
+                hits.append(("interp-delete", ASK, "A script one-liner deletes files."))
+        # shell commands passed from inside the code: os.system("..."), subprocess.run("..."), execSync("...")
+        if depth < 3:
+            for lit in re.findall(r"\"((?:[^\"\\]|\\.)*)\"|'([^']*)'", code):
+                s = lit[0] or lit[1]
+                if len(s) > 2:
+                    v, rid, why = check(s, cwd, depth + 1)
+                    if v != ALLOW:
+                        hits.append((rid, v, why + " (run from inside a " + m.group(1).split()[0] + " one-liner)"))
+    return hits
+
+
+def _self_protect(cmd):
+    if PROTECTED_IN_CMD.search(cmd) and not READ_ONLY_CMD.search(cmd):
+        return [("self-protect", ASK, "Touches the files that keep Seatbelt switched on.")]
+    return []
 
 
 def _inner_commands(cmd):
@@ -182,7 +226,7 @@ def check(cmd, cwd=None, _depth=0):
     # text that is only data (commit messages, echo/grep arguments) must not trigger rules
     scan = re.sub(r"(\s-m|\s--message)(=|\s+)(\"[^\"]*\"|'[^']*')", " ", norm)
     scan = re.sub(r"\b(echo|printf|grep|rg|ag)\b(\s+-\w+)*\s+(\"[^\"]*\"|'[^']*')", r"\1 ", scan)
-    hits = list(_rm_verdict(scan))
+    hits = list(_rm_verdict(scan)) + _interp_verdicts(norm, cwd, _depth) + _self_protect(norm)
     # look inside wrappers (bash -c, eval, $(...)) and into the scripts a command runs
     if _depth < 3:
         for inner in _inner_commands(norm):
@@ -269,21 +313,43 @@ def _deny(reason):
     return 0
 
 
+FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
 def cmd_hook(_args):
     """Claude Code PreToolUse hook. Reads the tool call JSON on stdin.
-    Fails closed: if Seatbelt can't read or check a Bash command, the command is denied."""
+    Fails closed: if Seatbelt can't read or check a command, the command is denied.
+    Checks Bash commands, and file edits that would switch Seatbelt itself off."""
     try:
         data = json.load(sys.stdin)
     except Exception:
         return _deny("Seatbelt could not read the tool call, so the command is not allowed.")
     try:
-        if not isinstance(data, dict) or data.get("tool_name") != "Bash":
+        if not isinstance(data, dict):
+            return _deny("Seatbelt could not read the tool call, so the command is not allowed.")
+        tool, inp = data.get("tool_name"), (data.get("tool_input") or {})
+        if tool == "Bash":
+            cmd = inp.get("command", "")
+            v, rule, why = check(cmd, data.get("cwd"))
+        elif tool in FILE_TOOLS:
+            path = inp.get("file_path") or inp.get("notebook_path") or ""
+            if not isinstance(path, str):
+                return _deny("Seatbelt could not read the file path, so the edit is not allowed.")
+            cmd = "%s %s" % (tool, path)
+            if PROTECTED.search(path.replace("\\", "/")):
+                v, rule, why = ASK, "self-protect", "The agent wants to edit a file that keeps Seatbelt switched on."
+            else:
+                return 0
+        else:
             return 0
-        cmd = (data.get("tool_input") or {}).get("command", "")
-        v, rule, why = check(cmd, data.get("cwd"))
+        mode = _load_config(data.get("cwd"))["mode"]
     except Exception as e:  # any bug in Seatbelt must never mean "allow"
         return _deny("Seatbelt hit an internal error (%s), so the command is not allowed." % type(e).__name__)
-    _log(cmd if isinstance(cmd, str) else repr(cmd), v, rule, "claude-code-hook")
+    shown = cmd if isinstance(cmd, str) else repr(cmd)
+    if mode == "shadow":
+        _log(shown, v, rule, "claude-code-hook", "shadow" if v != ALLOW else None)
+        return 0  # shadow mode: record what would have happened, change nothing
+    _log(shown, v, rule, "claude-code-hook")
     if v == ALLOW:
         return 0  # no decision: Claude Code's normal permission flow applies
     decision = "deny" if v == BLOCK else "ask"
@@ -303,6 +369,10 @@ def cmd_run(args):
         return 64
     cmd = args[0] if len(args) == 1 else " ".join(shlex.quote(a) for a in args)
     v, rule, why = check(cmd, os.getcwd())
+    if v != ALLOW and _load_config(os.getcwd())["mode"] == "shadow":
+        print(_line(v, cmd, rule, why) + "\n         (shadow mode: logged, not enforced)", file=sys.stderr)
+        _log(cmd, v, rule, "run", "shadow")
+        return subprocess.call(cmd, shell=True)
     if v == BLOCK:
         print(_line(v, cmd, rule, why), file=sys.stderr)
         _log(cmd, v, rule, "run", "refused")
@@ -340,6 +410,9 @@ def cmd_log(args):
     return 0
 
 
+MATCHER = "Bash|Edit|Write|MultiEdit|NotebookEdit"
+
+
 def cmd_install(args):
     """Add the hook to .claude/settings.json (project) or ~/.claude/settings.json (--global)."""
     base = os.path.expanduser("~") if "--global" in args else os.getcwd()
@@ -354,20 +427,66 @@ def cmd_install(args):
     for entry in pre:
         for h in entry.get("hooks", []):
             if "seatbelt" in h.get("command", ""):
-                print("Seatbelt is already installed in %s" % path)
-                return 0
-    pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": hook_cmd}]})
+                if entry.get("matcher") == MATCHER:
+                    print("Seatbelt is already installed in %s" % path)
+                    return 0
+                entry["matcher"] = MATCHER  # upgrade older installs that only watched Bash
+                break
+        else:
+            continue
+        break
+    else:
+        pre.append({"matcher": MATCHER, "hooks": [{"type": "command", "command": hook_cmd}]})
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
-    print(_c("32;1", "✓ Seatbelt installed") + " in %s\n  Every Bash command Claude Code runs is now checked first." % path)
+    print(_c("32;1", "✓ Seatbelt installed") + " in %s\n  Every Bash command Claude Code runs is now checked first,\n  and edits that would switch Seatbelt off need your approval." % path)
+    return 0
+
+
+def cmd_stats(args):
+    """Counts from the log: how often Seatbelt allowed, asked, blocked, and how often you said yes."""
+    days = int(args[1]) if len(args) > 1 and args[0] == "--days" else 7
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - days * 86400))
+    try:
+        with open(LOG_PATH) as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+    except OSError:
+        print("No log yet (%s)." % LOG_PATH)
+        return 0
+    rows = [r for r in rows if r.get("ts", "") >= cutoff]
+    n = len(rows)
+    if not n:
+        print("No commands in the last %d days." % days)
+        return 0
+    cnt = {k: sum(1 for r in rows if r["verdict"] == k) for k in (ALLOW, ASK, BLOCK)}
+    approved = sum(1 for r in rows if r.get("decision") == "approved")
+    shadow = sum(1 for r in rows if r.get("decision") == "shadow")
+    rules = {}
+    for r in rows:
+        if r.get("rule"):
+            rules[r["rule"]] = rules.get(r["rule"], 0) + 1
+    pct = lambda k: 100.0 * k / n
+    print("Seatbelt, last %d days: %d commands checked" % (days, n))
+    print("  %s %5d  (%.1f%%)" % (_c("32", "✓ allowed"), cnt[ALLOW], pct(cnt[ALLOW])))
+    print("  %s %5d  (%.1f%%)" % (_c("33", "⚠ asked  "), cnt[ASK], pct(cnt[ASK])))
+    print("  %s %5d  (%.1f%%)" % (_c("31", "⛔ blocked"), cnt[BLOCK], pct(cnt[BLOCK])))
+    if cnt[ASK]:
+        print("  you said yes to %d of %d asks: the ones you approve are your likely false positives" % (approved, cnt[ASK]))
+    if shadow:
+        print("  shadow mode: %d would-be stops logged, none enforced" % shadow)
+    if rules:
+        print("  top rules: " + ", ".join("%s %d" % kv for kv in sorted(rules.items(), key=lambda kv: -kv[1])[:5]))
     return 0
 
 
 def cmd_rules(_args):
     for rid, level, _rx, why in [("rm-root", BLOCK, "", "Recursive delete of root/home/current dir."),
-                                 ("rm-recursive", ASK, "", "Recursive delete of anything else.")] + RULES:
+                                 ("rm-recursive", ASK, "", "Recursive delete of anything else."),
+                                 ("interp-delete-root", BLOCK, "", "python -c / node -e / ruby -e deleting root or home."),
+                                 ("interp-delete", ASK, "", "python -c / node -e / ruby -e deleting files."),
+                                 ("self-protect", ASK, "", "Editing the files that keep Seatbelt switched on.")] + RULES:
         code, label = ICON[level]
         print("%s  %-18s %s" % (_c(code, label), rid, why))
     return 0
@@ -380,7 +499,10 @@ HELP = """seatbelt %s: a safety layer for AI coding agents
   seatbelt hook                  Claude Code PreToolUse hook (reads JSON on stdin)
   seatbelt install [--global]    add the hook to .claude/settings.json
   seatbelt log [-n 20]           show recent decisions
+  seatbelt stats [--days 7]      how often it allowed, asked, blocked
   seatbelt rules                 list built-in rules
+
+  SEATBELT_MODE=shadow           log what would be stopped, enforce nothing
 """ % __version__
 
 
@@ -393,7 +515,7 @@ def main(argv=None):
         print(__version__)
         return 0
     cmds = {"check": cmd_check, "hook": cmd_hook, "run": cmd_run, "log": cmd_log,
-            "install": cmd_install, "rules": cmd_rules}
+            "install": cmd_install, "rules": cmd_rules, "stats": cmd_stats}
     fn = cmds.get(argv[0])
     if not fn:
         print(HELP, file=sys.stderr)

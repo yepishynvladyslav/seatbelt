@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seatbelt-agent"
-version = "0.1.1"
+version = "0.2.0"
 description = "A safety layer for AI coding agents: blocks catastrophic shell commands, asks before irreversible ones, logs everything."
 readme = "README.md"
 license = { text = "MIT" }

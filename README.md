@@ -9,7 +9,9 @@ Seatbelt checks every shell command an AI agent wants to run *before* it runs:
 - ⚠️ **Irreversible commands need a human "yes".** Force pushes, `DROP TABLE`, `DELETE` without `WHERE`, `terraform destroy`, `kubectl delete`, `npm publish`, production deploys.
 - ✅ **Everything else runs normally,** and every decision is logged.
 
-One Python file. No dependencies. Works with **Claude Code** out of the box, and with any other agent through `seatbelt run`.
+One Python file. No dependencies.
+
+**New in v0.2:** catches `python -c` / `node -e` one-liners that delete files, stops an agent from quietly switching Seatbelt off, a **shadow mode** to try rules without enforcing them, and `seatbelt stats`. Most of this came from people breaking v0.1 in the replies. Thank you. Works with **Claude Code** out of the box, and with any other agent through `seatbelt run`.
 
 ```
 $ seatbelt check "rm -rf ~"
@@ -54,7 +56,7 @@ seatbelt install            # this project only
 seatbelt install --global   # every project
 ```
 
-This adds a `PreToolUse` hook to `.claude/settings.json`. From now on, every Bash command Claude Code wants to run goes through Seatbelt first:
+This adds a `PreToolUse` hook to `.claude/settings.json`. From now on, every Bash command Claude Code wants to run goes through Seatbelt first, and any edit to the files that keep Seatbelt on (`.claude/settings.json`, `.seatbelt.json`) needs your approval. Upgrading from v0.1? Run `seatbelt install` again to widen the hook.
 
 | Seatbelt says | Claude Code does |
 |---|---|
@@ -76,6 +78,25 @@ seatbelt run -- "git push --force origin main"
 ```
 
 With no human at the keyboard (CI, background agents), anything risky gets an automatic **no**.
+
+## Try it without risk: shadow mode
+
+Not sure the rules fit your workflow? Run it in shadow mode for a week. Nothing is blocked, every would-be stop is logged:
+
+```bash
+export SEATBELT_MODE=shadow      # or "mode": "shadow" in .seatbelt.json
+seatbelt stats                   # after a few days
+```
+
+```
+Seatbelt, last 7 days: 1,240 commands checked
+  ✓ allowed  1,226  (98.9%)
+  ⚠ asked       11  (0.9%)
+  ⛔ blocked      3  (0.2%)
+  shadow mode: 14 would-be stops logged, none enforced
+```
+
+(Example output. Your numbers will be your own.) Switch to enforcing once you trust it.
 
 ## See what your agent tried to do
 
@@ -118,6 +139,9 @@ Seatbelt is a seatbelt, not a crash-proof car.
 
 - **Fails closed.** If Seatbelt can't read or check a command (bad input, internal error), the hook denies it. A broken checker never means "allow".
 - **Looks inside wrappers.** `bash -c "…"`, `sh -c`, `eval`, `$(…)` and `base64 -d | sh` are unwrapped and checked. Local scripts the command runs (`bash x.sh`, `./x.sh`, `source x.sh`) are read and checked line by line. A script it can't read needs your approval.
+- **Catches script one-liners.** `python -c`, `node -e`, `ruby -e`, `perl -e` that delete files are flagged, and shell commands passed from inside them (`os.system("…")`) are checked too.
+- **Protects itself.** Edits to `.claude/settings.json` or `.seatbelt.json`, by Bash or by Claude Code's Edit/Write tools, need your approval.
+- **It is not a security boundary.** Seatbelt runs on the same machine, in the same trust domain as the agent. It's a seatbelt, not a circuit breaker. For a real boundary, run agents in a sandbox or container with no production credentials, and put anything that can delete, deploy or move money behind a separate service that has to say yes.
 - It still reads command text. A determined agent can hide intent in ways no text filter catches (a Python one-liner that deletes files, a script it writes and runs in two steps). Seatbelt catches the common, accidental disasters, not a deliberate attacker.
 - Use it **together with** backups, least-privilege credentials, and separate dev/prod access.
 - Found a dangerous command it misses, or a safe one it flags? Open an issue or a PR. Rules are plain regexes with tests.
