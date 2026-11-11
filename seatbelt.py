@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""
+Seatbelt: a safety layer for AI coding agents.
+
+Checks every shell command an agent wants to run. Catastrophic commands are
+blocked, irreversible ones need a human "yes", everything is logged.
+
+Works as:
+  * a Claude Code PreToolUse hook      (seatbelt hook)
+  * a command checker                  (seatbelt check "rm -rf /")
+  * a guarded runner for any agent     (seatbelt run -- <command>)
+
+Single file, no dependencies, Python 3.8+. MIT license.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+__version__ = "0.1.1"
+
+ALLOW, ASK, BLOCK = "allow", "ask", "block"
+RANK = {ALLOW: 0, ASK: 1, BLOCK: 2}
+
+# --------------------------------------------------------------------------- rules
+# Each rule: (id, level, regex, why). Regexes run case-insensitively on the
+# whole command line, after whitespace is normalised.
+RULES = [
+    # ---- catastrophic: always blocked
+    ("disk-wipe", BLOCK, r"\bmkfs(\.\w+)?\b|\bdd\b[^|;&]*\bof=/dev/(sd|nvme|hd|disk|xvd|vd)|>\s*/dev/(sd|nvme|hd|disk)\w*",
+     "Writes directly to a disk device. This destroys data."),
+    ("fork-bomb", BLOCK, r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
+     "Fork bomb. Freezes the machine."),
+    ("chmod-root", BLOCK, r"\bchmod\s+(-[a-z]*\s+)*-?R?\s*[0-7]*777\s+/(\s|$)|\bchown\s+-R\s+\S+\s+/(\s|$)",
+     "Changes permissions on the whole filesystem."),
+    ("pipe-to-shell", BLOCK, r"\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b|\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?python[0-9.]*\b",
+     "Downloads code from the internet and runs it without review."),
+    ("decode-to-shell", BLOCK, r"\b(base64|xxd|openssl)\b[^|;&]*(-d|--decode|-r|enc\s+-d)[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b",
+     "Decodes hidden text and runs it as a script. A classic way to sneak a command past a filter."),
+    ("secret-exfil", BLOCK, r"\b(curl|wget|nc|ncat|scp|rsync|ftp)\b.*(\.env\b|id_rsa|id_ed25519|\.ssh/|\.aws/credentials|\.netrc|\.npmrc|\.pypirc)",
+     "Sends secrets (keys, .env, credentials) to another machine."),
+
+    # ---- irreversible: needs a human yes
+    ("git-force-push", ASK, r"\bgit\s+push\b.*(\s--force(-with-lease)?\b|\s-f\b|\s\+\S+)",
+     "Force push rewrites shared history. Other people's work can be lost."),
+    ("git-hard-reset", ASK, r"\bgit\s+reset\s+.*--hard\b|\bgit\s+reset\s+--hard\b",
+     "Throws away uncommitted work."),
+    ("git-clean", ASK, r"\bgit\s+clean\s+(-\w*f\w*)",
+     "Deletes untracked files permanently."),
+    ("git-branch-delete", ASK, r"\bgit\s+branch\s+(-D|--delete\s+--force)\b|\bgit\s+push\s+\S+\s+--delete\b|\bgit\s+push\s+\S+\s+:\S+",
+     "Deletes a branch, possibly with unmerged work."),
+    ("git-discard", ASK, r"\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)|\bgit\s+stash\s+(drop|clear)\b",
+     "Discards local changes."),
+    ("sql-drop", ASK, r"\bdrop\s+(table|database|schema|index|view|collection)\b|\bdropdb\b|\.drop\(\)|\bdropDatabase\(",
+     "Drops database objects. Data is gone unless you have a backup."),
+    ("sql-truncate", ASK, r"\btruncate\s+(table\s+)?\w+",
+     "Empties a table."),
+    ("sql-delete-all", ASK, r"\bdelete\s+from\s+[\w.\"`]+\s*(;|\"|'|$)|\bdeleteMany\(\s*\{\s*\}\s*\)",
+     "DELETE without WHERE removes every row."),
+    ("sql-alter-drop", ASK, r"\balter\s+table\s+\S+\s+drop\b",
+     "Drops a column or constraint."),
+    ("db-reset", ASK, r"\bprisma\s+migrate\s+reset\b|\bdb:(drop|reset|purge)\b|\bmanage\.py\s+flush\b|\balembic\s+downgrade\b|\bmigrate:(fresh|reset|rollback)\b|\bredis-cli\b.*\bflush(all|db)\b|\bFLUSHALL\b",
+     "Resets or rolls back a database."),
+    ("infra-destroy", ASK, r"\bterraform\s+(destroy|apply\b.*-auto-approve)|\bpulumi\s+destroy\b|\bcdk\s+destroy\b|\bkubectl\s+delete\b|\bhelm\s+(uninstall|delete)\b",
+     "Destroys or changes live infrastructure."),
+    ("cloud-delete", ASK, r"\b(aws|gcloud|az|doctl|flyctl|fly|heroku)\b.*\b(delete|destroy|terminate|remove|rm|rb)\b",
+     "Deletes cloud resources."),
+    ("docker-prune", ASK, r"\bdocker\s+(system|volume|image)\s+prune\b|\bdocker\s+volume\s+rm\b|\bdocker\s+compose\s+down\b.*\s-v\b",
+     "Deletes Docker data or volumes."),
+    ("publish", ASK, r"\bnpm\s+publish\b|\bpnpm\s+publish\b|\byarn\s+publish\b|\btwine\s+upload\b|\bcargo\s+publish\b|\bgem\s+push\b|\bpoetry\s+publish\b",
+     "Publishes a package publicly. Versions can't be taken back."),
+    ("prod-deploy", ASK, r"\bvercel\b.*--prod\b|\bnetlify\s+deploy\b.*--prod\b|\bfly(ctl)?\s+deploy\b|\bgit\s+push\s+heroku\b|\bfirebase\s+deploy\b",
+     "Deploys to production."),
+    ("sudo", ASK, r"(^|[;&|]\s*)sudo\b",
+     "Runs with root privileges."),
+    ("read-secrets", ASK, r"\b(cat|less|more|head|tail|bat|type)\b[^|;&]*(\.env\b|id_rsa|id_ed25519|\.aws/credentials|\.netrc)|\bprintenv\b|(^|[;&|]\s*)env(\s*$|\s*[|;&])",
+     "Prints secrets into the agent's context."),
+    ("kill-all", ASK, r"\bkillall\b|\bpkill\s+-9\b|\bkill\s+-9\s+-1\b|\bshutdown\b|\breboot\b",
+     "Kills processes or shuts the machine down."),
+]
+
+RM_SAFE_TARGETS = re.compile(r"^(\./)?(node_modules|dist|build|out|\.next|\.nuxt|\.turbo|\.cache|coverage|target|__pycache__|\.pytest_cache|\.venv|venv|tmp)/?$")
+RM_DANGER_TARGETS = re.compile(r"^(/|/\*|~|~/|~/\*|\$HOME/?|\$HOME/\*|\*|\.|\./|\./\*|\.\.|\.\./?|/(etc|usr|var|bin|lib|boot|home|root|opt|srv)/?)$")
+
+
+def _rm_verdict(cmd):
+    """rm needs real parsing: flags can be combined (-rf, -fr, -Rf, --recursive)."""
+    results = []
+    for part in re.split(r"[;&|]+|\bthen\b|\bdo\b", cmd):
+        try:
+            toks = shlex.split(part, posix=True)
+        except ValueError:
+            toks = part.split()
+        while toks and toks[0] in ("sudo", "command", "nice", "time", "xargs", "env"):
+            toks = toks[1:]
+        if not toks or os.path.basename(toks[0]) != "rm":
+            continue
+        flags = [t for t in toks[1:] if t.startswith("-")]
+        targets = [t for t in toks[1:] if not t.startswith("-")]
+        recursive = any(f == "--recursive" or (not f.startswith("--") and re.search(r"[rR]", f)) for f in flags)
+        if not recursive:
+            continue
+        if targets and all(RM_SAFE_TARGETS.match(t) for t in targets):
+            continue  # build output and caches are safe to delete
+        if not targets or any(RM_DANGER_TARGETS.match(t) for t in targets) or "--no-preserve-root" in flags:
+            results.append(("rm-root", BLOCK, "Recursive delete of the root, home or current directory."))
+        else:
+            results.append(("rm-recursive", ASK, "Recursive delete: " + " ".join(targets[:3])))
+    return results
+
+
+# --------------------------------------------------------------------------- config
+def _load_config(cwd=None):
+    """Optional .seatbelt.json in the project or home dir:
+    {"allow": ["regex"], "ask": ["regex"], "block": ["regex"]}"""
+    cfg = {"allow": [], "ask": [], "block": []}
+    paths = [os.path.expanduser("~/.seatbelt.json")]
+    if cwd:
+        paths.append(os.path.join(cwd, ".seatbelt.json"))
+    for p in paths:
+        try:
+            with open(p) as f:
+                data = json.load(f)
+            for k in cfg:
+                cfg[k] += list(data.get(k, []))
+        except (OSError, ValueError):
+            pass
+    return cfg
+
+
+SHELLS = r"(?:ba|z|da|k|fi)?sh"
+SCRIPT_MAX = 256 * 1024
+
+
+def _inner_commands(cmd):
+    """Commands hidden inside other commands: bash -c "...", eval "...", $(...), `...`."""
+    out = []
+    for m in re.finditer(r"\b(?:" + SHELLS + r"|sudo\s+" + SHELLS + r")\s+(?:-\w+\s+)*-\w*c\w*\s+(\"(?:[^\"\\]|\\.)*\"|'[^']*'|\S+)", cmd):
+        out.append(m.group(1))
+    for m in re.finditer(r"\beval\s+(\"(?:[^\"\\]|\\.)*\"|'[^']*'|.+)", cmd):
+        out.append(m.group(1))
+    out += re.findall(r"\$\(([^()]*)\)", cmd) + re.findall(r"`([^`]*)`", cmd)
+    return [s[1:-1] if len(s) > 1 and s[0] == s[-1] and s[0] in "\"'" else s for s in out]
+
+
+def _scripts(cmd, cwd):
+    """Local scripts the command runs: bash x.sh, sh x.sh, source x.sh, . x.sh, ./x.sh"""
+    paths = []
+    for part in re.split(r"[;&|]+", cmd):
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            toks = part.split()
+        while toks and toks[0] in ("sudo", "nohup", "time", "nice", "exec"):
+            toks = toks[1:]
+        if not toks:
+            continue
+        head = os.path.basename(toks[0])
+        if re.fullmatch(SHELLS, head) or head in ("source", "."):
+            args = [t for t in toks[1:] if not t.startswith("-")]
+            if args and "-c" not in toks[1:]:
+                paths.append(args[0])
+        elif toks[0].startswith(("./", "/", "../", "~/")) and not re.fullmatch(r"/(usr/)?s?bin/\S+", toks[0]):
+            paths.append(toks[0])
+    return [os.path.join(cwd or os.getcwd(), os.path.expanduser(p)) for p in paths]
+
+
+def check(cmd, cwd=None, _depth=0):
+    """Return (verdict, rule_id, why) for a shell command."""
+    if not isinstance(cmd, str):
+        return BLOCK, "unverifiable", "Seatbelt could not read this command, so it is not allowed."
+    norm = " ".join(cmd.strip().split())
+    if not norm:
+        return ALLOW, None, None
+    cfg = _load_config(cwd)
+    for rx in cfg["allow"]:
+        if re.search(rx, norm, re.I):
+            return ALLOW, "user-allow", "Allowed by your .seatbelt.json"
+    # text that is only data (commit messages, echo/grep arguments) must not trigger rules
+    scan = re.sub(r"(\s-m|\s--message)(=|\s+)(\"[^\"]*\"|'[^']*')", " ", norm)
+    scan = re.sub(r"\b(echo|printf|grep|rg|ag)\b(\s+-\w+)*\s+(\"[^\"]*\"|'[^']*')", r"\1 ", scan)
+    hits = list(_rm_verdict(scan))
+    # look inside wrappers (bash -c, eval, $(...)) and into the scripts a command runs
+    if _depth < 3:
+        for inner in _inner_commands(norm):
+            v, rid, why = check(inner, cwd, _depth + 1)
+            if v != ALLOW:
+                hits.append((rid, v, why + " (hidden inside another command)"))
+        for path in _scripts(norm, cwd):
+            try:
+                if os.path.getsize(path) > SCRIPT_MAX:
+                    hits.append(("script-too-big", ASK, "Script is too large to check: " + os.path.basename(path)))
+                    continue
+                with open(path, errors="replace") as f:
+                    body = f.read()
+                if "\x00" in body:
+                    continue  # compiled binary, not a script
+            except OSError:
+                if os.path.splitext(path)[1] in (".sh", ".bash", ".zsh") or os.path.basename(path).startswith("."):
+                    hits.append(("script-unreadable", ASK, "Can't read the script to check it: " + os.path.basename(path)))
+                continue
+            for line in body.splitlines():
+                line = line.split("#", 1)[0] if not line.lstrip().startswith("#!") else ""
+                v, rid, why = check(line, cwd, _depth + 1)
+                if v != ALLOW:
+                    hits.append((rid, v, why + " (inside " + os.path.basename(path) + ")"))
+    for rid, level, rx, why in RULES:
+        if re.search(rx, scan, re.I):
+            hits.append((rid, level, why))
+    for rx in cfg["block"]:
+        if re.search(rx, norm, re.I):
+            hits.append(("user-block", BLOCK, "Blocked by your .seatbelt.json"))
+    for rx in cfg["ask"]:
+        if re.search(rx, norm, re.I):
+            hits.append(("user-ask", ASK, "Needs approval per your .seatbelt.json"))
+    if not hits:
+        return ALLOW, None, None
+    rid, level, why = max(hits, key=lambda h: RANK[h[1]])
+    return level, rid, why
+
+
+# --------------------------------------------------------------------------- log
+LOG_PATH = os.environ.get("SEATBELT_LOG", os.path.expanduser("~/.seatbelt/log.jsonl"))
+
+
+def _log(cmd, verdict, rule, source, decision=None):
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "source": source, "verdict": verdict,
+                                "rule": rule, "decision": decision, "cmd": cmd}) + "\n")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- output
+def _c(code, s):
+    return "\033[%sm%s\033[0m" % (code, s) if sys.stdout.isatty() and not os.environ.get("NO_COLOR") else s
+
+
+ICON = {ALLOW: ("32", "✓ ALLOW"), ASK: ("33", "⚠ ASK  "), BLOCK: ("31", "⛔ BLOCK")}
+
+
+def _line(verdict, cmd, rule, why):
+    code, label = ICON[verdict]
+    out = _c(code + ";1", label) + "  " + cmd
+    if rule:
+        out += "\n         " + _c("2", "%s · %s" % (rule, why))
+    return out
+
+
+# --------------------------------------------------------------------------- commands
+def cmd_check(args):
+    if not args:
+        print("usage: seatbelt check \"<command>\"", file=sys.stderr)
+        return 64
+    cmd = " ".join(args)
+    v, rule, why = check(cmd, os.getcwd())
+    print(_line(v, cmd, rule, why))
+    return RANK[v]
+
+
+def _deny(reason):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+    return 0
+
+
+def cmd_hook(_args):
+    """Claude Code PreToolUse hook. Reads the tool call JSON on stdin.
+    Fails closed: if Seatbelt can't read or check a Bash command, the command is denied."""
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return _deny("Seatbelt could not read the tool call, so the command is not allowed.")
+    try:
+        if not isinstance(data, dict) or data.get("tool_name") != "Bash":
+            return 0
+        cmd = (data.get("tool_input") or {}).get("command", "")
+        v, rule, why = check(cmd, data.get("cwd"))
+    except Exception as e:  # any bug in Seatbelt must never mean "allow"
+        return _deny("Seatbelt hit an internal error (%s), so the command is not allowed." % type(e).__name__)
+    _log(cmd if isinstance(cmd, str) else repr(cmd), v, rule, "claude-code-hook")
+    if v == ALLOW:
+        return 0  # no decision: Claude Code's normal permission flow applies
+    decision = "deny" if v == BLOCK else "ask"
+    reason = "Seatbelt %s [%s]: %s" % ("blocked this" if v == BLOCK else "needs your approval", rule, why)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                             "permissionDecision": decision,
+                                             "permissionDecisionReason": reason}}))
+    return 0
+
+
+def cmd_run(args):
+    """Guarded runner: seatbelt run -- <command ...>"""
+    if args and args[0] == "--":
+        args = args[1:]
+    if not args:
+        print("usage: seatbelt run -- <command>", file=sys.stderr)
+        return 64
+    cmd = args[0] if len(args) == 1 else " ".join(shlex.quote(a) for a in args)
+    v, rule, why = check(cmd, os.getcwd())
+    if v == BLOCK:
+        print(_line(v, cmd, rule, why), file=sys.stderr)
+        _log(cmd, v, rule, "run", "refused")
+        return 126
+    if v == ASK:
+        print(_line(v, cmd, rule, why), file=sys.stderr)
+        ok = False
+        if sys.stdin.isatty():
+            try:
+                ok = input("         Run it? [y/N] ").strip().lower() in ("y", "yes")
+            except EOFError:
+                ok = False
+        else:
+            print("         No human at the keyboard, so the answer is no.", file=sys.stderr)
+        _log(cmd, v, rule, "run", "approved" if ok else "declined")
+        if not ok:
+            return 126
+    else:
+        _log(cmd, v, rule, "run", "ran")
+    return subprocess.call(cmd, shell=True)
+
+
+def cmd_log(args):
+    n = int(args[1]) if len(args) > 1 and args[0] == "-n" else 20
+    try:
+        with open(LOG_PATH) as f:
+            lines = f.readlines()[-n:]
+    except OSError:
+        print("No log yet (%s)." % LOG_PATH)
+        return 0
+    for ln in lines:
+        e = json.loads(ln)
+        code, label = ICON[e["verdict"]]
+        print("%s  %s  %s%s" % (e["ts"], _c(code, label), e["cmd"], ("  [" + e["decision"] + "]") if e.get("decision") else ""))
+    return 0
+
+
+def cmd_install(args):
+    """Add the hook to .claude/settings.json (project) or ~/.claude/settings.json (--global)."""
+    base = os.path.expanduser("~") if "--global" in args else os.getcwd()
+    path = os.path.join(base, ".claude", "settings.json")
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        settings = {}
+    hook_cmd = '"%s" "%s" hook' % (sys.executable, os.path.abspath(__file__))
+    pre = settings.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    for entry in pre:
+        for h in entry.get("hooks", []):
+            if "seatbelt" in h.get("command", ""):
+                print("Seatbelt is already installed in %s" % path)
+                return 0
+    pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": hook_cmd}]})
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+    print(_c("32;1", "✓ Seatbelt installed") + " in %s\n  Every Bash command Claude Code runs is now checked first." % path)
+    return 0
+
+
+def cmd_rules(_args):
+    for rid, level, _rx, why in [("rm-root", BLOCK, "", "Recursive delete of root/home/current dir."),
+                                 ("rm-recursive", ASK, "", "Recursive delete of anything else.")] + RULES:
+        code, label = ICON[level]
+        print("%s  %-18s %s" % (_c(code, label), rid, why))
+    return 0
+
+
+HELP = """seatbelt %s: a safety layer for AI coding agents
+
+  seatbelt check "<command>"     check one command (exit 0 allow, 1 ask, 2 block)
+  seatbelt run -- <command>      run a command, asking first if it's risky
+  seatbelt hook                  Claude Code PreToolUse hook (reads JSON on stdin)
+  seatbelt install [--global]    add the hook to .claude/settings.json
+  seatbelt log [-n 20]           show recent decisions
+  seatbelt rules                 list built-in rules
+""" % __version__
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(HELP)
+        return 0
+    if argv[0] in ("-V", "--version"):
+        print(__version__)
+        return 0
+    cmds = {"check": cmd_check, "hook": cmd_hook, "run": cmd_run, "log": cmd_log,
+            "install": cmd_install, "rules": cmd_rules}
+    fn = cmds.get(argv[0])
+    if not fn:
+        print(HELP, file=sys.stderr)
+        return 64
+    return fn(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
