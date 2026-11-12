@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 ALLOW, ASK, BLOCK = "allow", "ask", "block"
 RANK = {ALLOW: 0, ASK: 1, BLOCK: 2}
@@ -34,17 +34,19 @@ RULES = [
      "Writes directly to a disk device. This destroys data."),
     ("fork-bomb", BLOCK, r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
      "Fork bomb. Freezes the machine."),
-    ("chmod-root", BLOCK, r"\bchmod\s+(-[a-z]*\s+)*-?R?\s*[0-7]*777\s+/(\s|$)|\bchown\s+-R\s+\S+\s+/(\s|$)",
+    ("chmod-root", BLOCK, r"\bchmod\s+(-\w+\s+)*-R\s+(-\w+\s+)*[0-7]{3,4}\s+(/|~|~/|\$HOME/?)(\s|$)|\bchmod\s+(-[a-z]*\s+)*-?R?\s*[0-7]*777\s+/(\s|$)|\bchown\s+-R\s+\S+\s+(/|~|\$HOME)(\s|$)",
      "Changes permissions on the whole filesystem."),
     ("pipe-to-shell", BLOCK, r"\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b|\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?python[0-9.]*\b",
      "Downloads code from the internet and runs it without review."),
     ("decode-to-shell", BLOCK, r"\b(base64|xxd|openssl)\b[^|;&]*(-d|--decode|-r|enc\s+-d)[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b",
      "Decodes hidden text and runs it as a script. A classic way to sneak a command past a filter."),
+    ("env-exfil", BLOCK, r"(^|[;&|]\s*)(env|printenv|set|export\s+-p)\b[^;&]*\|\s*(curl|wget|nc|ncat|socat|ssh|scp)\b",
+     "Sends every environment variable, API keys included, to another machine."),
     ("secret-exfil", BLOCK, r"\b(curl|wget|nc|ncat|scp|rsync|ftp)\b.*(\.env\b|id_rsa|id_ed25519|\.ssh/|\.aws/credentials|\.netrc|\.npmrc|\.pypirc)",
      "Sends secrets (keys, .env, credentials) to another machine."),
 
     # ---- irreversible: needs a human yes
-    ("git-force-push", ASK, r"\bgit\s+push\b.*(\s--force(-with-lease)?\b|\s-f\b|\s\+\S+)",
+    ("git-force-push", ASK, r"\bgit\s+push\b.*(\s--force(-with-lease)?\b|\s-f\b|\s\+\S+|\s--mirror\b|\s--prune\b)",
      "Force push rewrites shared history. Other people's work can be lost."),
     ("git-hard-reset", ASK, r"\bgit\s+reset\s+.*--hard\b|\bgit\s+reset\s+--hard\b",
      "Throws away uncommitted work."),
@@ -78,6 +80,24 @@ RULES = [
      "Runs with root privileges."),
     ("read-secrets", ASK, r"\b(cat|less|more|head|tail|bat|type)\b[^|;&]*(\.env\b|id_rsa|id_ed25519|\.aws/credentials|\.netrc)|\bprintenv\b|(^|[;&|]\s*)env(\s*$|\s*[|;&])",
      "Prints secrets into the agent's context."),
+    ("find-delete", ASK, r"\bfind\b[^|;&]*(\s-delete\b|\s-exec(dir)?\s+(sudo\s+)?(rm|shred|unlink)\b)",
+     "find that deletes every file it matches."),
+    ("empty-file", ASK, r"(^|[;&|]\s*)(:\s*)?>\s*[^>&\s]+|\btruncate\s+(-\w+\s+)*(-s|--size)\s*=?\s*0\b|\bcp\s+/dev/null\s+\S+|\bdd\b[^|;&]*\bif=/dev/(zero|urandom|random)\b[^|;&]*\bof=",
+     "Empties or overwrites a file. If it's a database or a key, the data is gone."),
+    ("move-to-null", ASK, r"\bmv\b[^|;&]*\s/dev/null(\s|$)",
+     "Moving something into /dev/null destroys it."),
+    ("rsync-delete", ASK, r"\brsync\b[^|;&]*\s--delete(-\w+)?\b",
+     "rsync --delete removes everything in the destination that isn't in the source."),
+    ("shred", ASK, r"\bshred\b|\bsrm\b|\bwipe\b\s+-",
+     "Securely destroys files. There is no undo."),
+    ("crontab-remove", ASK, r"\bcrontab\s+(-\w*r\w*)\b",
+     "Deletes every scheduled job for this user."),
+    ("docker-rm", ASK, r"\bdocker\s+(rm|rmi|container\s+rm|image\s+rm)\s+(-\w*f\w*|--force)\b|\bdocker\s+(kill|stop)\s+\$\(",
+     "Force-removes Docker containers or images."),
+    ("erase-history", ASK, r"\bhistory\s+-c\b|\bunset\s+HISTFILE\b|(\.bash_history|\.zsh_history)\b[^|;&]*$|\bHISTSIZE=0\b",
+     "Erases the shell history, which is part of the audit trail."),
+    ("var-command", ASK, r"(^|[;&|]\s*)\$\{?\w+\}?(\s|$)",
+     "Runs a command whose name is hidden in a variable."),
     ("kill-all", ASK, r"\bkillall\b|\bpkill\s+-9\b|\bkill\s+-9\s+-1\b|\bshutdown\b|\breboot\b",
      "Kills processes or shuts the machine down."),
 ]
@@ -212,6 +232,30 @@ def _scripts(cmd, cwd):
     return [os.path.join(cwd or os.getcwd(), os.path.expanduser(p)) for p in paths]
 
 
+def _expand_vars(cmd):
+    """Resolve simple assignments in the same command: X=rm; $X -rf ~  ->  rm -rf ~"""
+    env = {}
+    for m in re.finditer(r"(?:^|[;&|]\s*|\s)(?:export\s+)?([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]*)", cmd):
+        v = m.group(2)
+        env[m.group(1)] = v[1:-1] if v[:1] in "\"'" else v
+    if not env:
+        return cmd
+    return re.sub(r"\$\{?([A-Za-z_]\w*)\}?", lambda m: env.get(m.group(1), m.group(0)), cmd)
+
+
+INTERP_NAMES = r"(python[0-9.]*|node|nodejs|ruby|perl|php|bun)"
+
+
+def _stdin_code(cmd):
+    """Code fed through stdin: python3 - <<< "...", echo "..." | sh, printf '...' | python3"""
+    out = []
+    for m in re.finditer(r"\b(" + SHELLS + r"|" + INTERP_NAMES + r")\b[^|;&<]*<<<\s*(\"(?:[^\"\\]|\\.)*\"|'[^']*')", cmd):
+        out.append((m.group(1), m.group(m.lastindex)[1:-1]))
+    for m in re.finditer(r"\b(?:echo|printf)\s+(?:-\w+\s+)*(\"(?:[^\"\\]|\\.)*\"|'[^']*')\s*\|\s*(?:sudo\s+)?(" + SHELLS + r"|" + INTERP_NAMES + r")\b", cmd):
+        out.append((m.group(2), m.group(1)[1:-1]))
+    return out
+
+
 def check(cmd, cwd=None, _depth=0):
     """Return (verdict, rule_id, why) for a shell command."""
     if not isinstance(cmd, str):
@@ -226,7 +270,21 @@ def check(cmd, cwd=None, _depth=0):
     # text that is only data (commit messages, echo/grep arguments) must not trigger rules
     scan = re.sub(r"(\s-m|\s--message)(=|\s+)(\"[^\"]*\"|'[^']*')", " ", norm)
     scan = re.sub(r"\b(echo|printf|grep|rg|ag)\b(\s+-\w+)*\s+(\"[^\"]*\"|'[^']*')", r"\1 ", scan)
+    expanded = _expand_vars(scan)
+    if expanded != scan and _depth < 3:
+        v, rid, why = check(expanded, cwd, _depth + 1)
+        if v != ALLOW:
+            return v, rid, why + " (hidden in a variable)"
     hits = list(_rm_verdict(scan)) + _interp_verdicts(norm, cwd, _depth) + _self_protect(norm)
+    for target, code in _stdin_code(norm):
+        if _depth >= 3:
+            break
+        if re.fullmatch(SHELLS, target):
+            v, rid, why = check(code, cwd, _depth + 1)
+        else:
+            v, rid, why = check('%s -c "%s"' % (target, code.replace("\\", "\\\\").replace('"', '\\"')), cwd, _depth + 1)
+        if v != ALLOW:
+            hits.append((rid, v, why + " (piped into " + target + ")"))
     # look inside wrappers (bash -c, eval, $(...)) and into the scripts a command runs
     if _depth < 3:
         for inner in _inner_commands(norm):

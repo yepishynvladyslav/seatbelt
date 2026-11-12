@@ -11,6 +11,8 @@ Seatbelt checks every shell command an AI agent wants to run *before* it runs:
 
 One Python file. No dependencies.
 
+**New in v0.3:** I asked Claude to attack v0.2 with 25 new tricks. 18 got through. Now all 25 are stopped, and 15 everyday commands still run untouched. Both lists live in `tests/` and run on every push: `find -delete`, commands hidden in variables, `echo "…" | sh`, `python3 - <<<`, emptying a database with `> prod.db`, `env | curl`, `chmod -R 000 ~`, `crontab -r`, `git push --mirror`, and more.
+
 **New in v0.2:** catches `python -c` / `node -e` one-liners that delete files, stops an agent from quietly switching Seatbelt off, a **shadow mode** to try rules without enforcing them, and `seatbelt stats`. Most of this came from people breaking v0.1 in the replies. Thank you. Works with **Claude Code** out of the box, and with any other agent through `seatbelt run`.
 
 ```

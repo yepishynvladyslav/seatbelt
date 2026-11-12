@@ -166,6 +166,23 @@ class Shadow(unittest.TestCase):
         self.assertIn("commands checked", p.stdout)
 
 
+class RedTeam(unittest.TestCase):
+    """Attacks Claude wrote against v0.2.0 (18 of 25 got through) and everyday commands that must keep running."""
+    def lines(self, name):
+        with open(os.path.join(HERE, name)) as f:
+            return [l.rstrip("\n") for l in f if l.strip()]
+
+    def test_every_attack_is_stopped(self):
+        for c in self.lines("redteam_attacks.txt"):
+            with self.subTest(c=c):
+                self.assertNotEqual(seatbelt.check(c)[0], seatbelt.ALLOW, c)
+
+    def test_normal_work_still_runs(self):
+        for c in self.lines("redteam_normal.txt"):
+            with self.subTest(c=c):
+                self.assertEqual(seatbelt.check(c)[0], seatbelt.ALLOW, c)
+
+
 class Config(unittest.TestCase):
     def test_project_config(self):
         d = tempfile.mkdtemp()

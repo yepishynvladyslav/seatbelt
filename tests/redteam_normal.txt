@@ -1,0 +1,15 @@
+find . -name "*.py"
+echo hi > out.txt
+npm test > test.log 2>&1
+docker ps -a
+rsync -a src/ dst/
+mv a.txt b.txt
+cat data.csv | python3 analyze.py
+python3 - <<< "print(1)"
+echo "hello" | sh
+git push origin feature/x
+PORT=3000 npm start
+export NODE_ENV=production && npm run build
+history | tail
+chmod 644 README.md
+cp .env.example .env
