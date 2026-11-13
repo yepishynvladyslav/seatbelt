@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 ALLOW, ASK, BLOCK = "allow", "ask", "block"
 RANK = {ALLOW: 0, ASK: 1, BLOCK: 2}
@@ -172,24 +172,44 @@ DANGER_ARG = re.compile(r"(['\"])(/|~|~/|/home/?|/root/?|/etc/?|/usr/?|/var/?|\.
                         r"environ\[['\"]HOME['\"]\]|getenv\(['\"]HOME['\"]\)|ENV\[['\"]HOME['\"]\]|process\.env\.HOME")
 
 
-def _interp_verdicts(cmd, cwd, depth):
+RUNNER_CALL = re.compile(r"(os\.system|os\.popen|subprocess\.\w+|Popen|check_output|check_call|exec(?:Sync)?|spawn(?:Sync)?|execFile(?:Sync)?|Kernel\.system|`)\s*\(?\s*\[?\s*(\"(?:[^\"\\]|\\.)*\"|'[^']*')")
+ASSIGN = re.compile(r"^\s*(?:const|let|var|my)?\s*\$?([A-Za-z_]\w*)\s*=\s*(.+)$")
+
+
+def _code_hits(code, label, cwd, depth, whole_file=False):
+    """Check program source (a one-liner or a whole .py/.js/.rb file) for deletes and shell-outs."""
     hits = []
-    for m in INTERP.finditer(cmd):
-        code = m.group(3) or m.group(4) or ""
-        code = code[1:-1]
-        if DELETE_API.search(code):
-            if DANGER_ARG.search(code):
-                hits.append(("interp-delete-root", BLOCK, "A script one-liner deletes the root or home directory."))
+    lines = code.splitlines() if whole_file else [code]
+    danger_vars = set()
+    for ln in lines:
+        m = ASSIGN.match(ln)
+        if m and DANGER_ARG.search(m.group(2)):
+            danger_vars.add(m.group(1))
+    for ln in lines:
+        if DELETE_API.search(ln):
+            uses_var = any(re.search(r"\b" + re.escape(v) + r"\b", ln.split("=", 1)[-1]) for v in danger_vars)
+            if DANGER_ARG.search(ln) or uses_var:
+                hits.append(("interp-delete-root", BLOCK, "Code deletes the root or home directory."))
             else:
-                hits.append(("interp-delete", ASK, "A script one-liner deletes files."))
-        # shell commands passed from inside the code: os.system("..."), subprocess.run("..."), execSync("...")
+                hits.append(("interp-delete", ASK, "Code deletes files."))
         if depth < 3:
-            for lit in re.findall(r"\"((?:[^\"\\]|\\.)*)\"|'([^']*)'", code):
-                s = lit[0] or lit[1]
+            lits = RUNNER_CALL.findall(ln) if whole_file else [(None, l) for l in re.findall(r"(\"(?:[^\"\\]|\\.)*\"|'[^']*')", ln)]
+            for _, lit in lits:
+                s = lit[1:-1]
                 if len(s) > 2:
                     v, rid, why = check(s, cwd, depth + 1)
                     if v != ALLOW:
-                        hits.append((rid, v, why + " (run from inside a " + m.group(1).split()[0] + " one-liner)"))
+                        hits.append((rid, v, why + " (run from inside " + label + ")"))
+    return hits
+
+
+def _interp_verdicts(cmd, cwd, depth):
+    hits = []
+    for m in INTERP.finditer(cmd):
+        code = (m.group(3) or m.group(4) or "")[1:-1]
+        label = "a " + (m.group(1) or "deno").split()[0] + " one-liner"
+        for rid, v, why in _code_hits(code, label, cwd, depth):
+            hits.append((rid, v, why.replace("Code deletes", "A script one-liner deletes")))
     return hits
 
 
@@ -230,6 +250,125 @@ def _scripts(cmd, cwd):
         elif toks[0].startswith(("./", "/", "../", "~/")) and not re.fullmatch(r"/(usr/)?s?bin/\S+", toks[0]):
             paths.append(toks[0])
     return [os.path.join(cwd or os.getcwd(), os.path.expanduser(p)) for p in paths]
+
+
+CODE_RUNNERS = {"python", "python3", "python2", "node", "nodejs", "ruby", "perl", "php", "bun", "deno", "tsx", "ts-node"}
+
+
+def _program_files(cmd, cwd):
+    """Source files a command hands to an interpreter: python3 clean.py, node x.js, deno run x.ts"""
+    out = []
+    for part in re.split(r"[;&|]+", cmd):
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            toks = part.split()
+        while toks and toks[0] in ("sudo", "nohup", "time", "nice", "exec", "uv", "poetry", "pipenv") or (toks and toks[0] == "run"):
+            toks = toks[1:]
+        if not toks:
+            continue
+        head = os.path.basename(toks[0])
+        if re.fullmatch(r"python[0-9.]*", head) or head in CODE_RUNNERS:
+            args = toks[1:]
+            if head == "deno" and args[:1] == ["run"]:
+                args = args[1:]
+            if any(a in ("-c", "-e", "-r", "--eval", "-m") for a in args):
+                continue
+            files = [a for a in args if not a.startswith("-")]
+            if files:
+                out.append(os.path.join(cwd or os.getcwd(), os.path.expanduser(files[0])))
+    return out
+
+
+def _make_recipes(cmd, cwd):
+    """Recipe lines that `make [target]` would run, read from the Makefile."""
+    out = []
+    for part in re.split(r"[;&|]+", cmd):
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            continue
+        if not toks or os.path.basename(toks[0]) not in ("make", "gmake"):
+            continue
+        d, mf, targets, i = cwd or os.getcwd(), None, [], 1
+        while i < len(toks):
+            t = toks[i]
+            if t in ("-C", "-f") and i + 1 < len(toks):
+                if t == "-C":
+                    d = os.path.join(d, toks[i + 1])
+                else:
+                    mf = toks[i + 1]
+                i += 2
+                continue
+            if not t.startswith("-") and "=" not in t:
+                targets.append(t)
+            i += 1
+        names = [mf] if mf else ["GNUmakefile", "makefile", "Makefile"]
+        path = next((os.path.join(d, n) for n in names if os.path.isfile(os.path.join(d, n))), None)
+        if not path:
+            continue
+        try:
+            with open(path, errors="replace") as f:
+                text = f.read(SCRIPT_MAX)
+        except OSError:
+            continue
+        rules, cur, first = {}, None, None
+        for ln in text.splitlines():
+            m = re.match(r"^([A-Za-z0-9_.%/-]+(?:\s+[A-Za-z0-9_.%/-]+)*)\s*::?\s*([^=].*)?$", ln)
+            if m and not ln.startswith("\t"):
+                cur = m.group(1).split()
+                for c in cur:
+                    rules.setdefault(c, {"deps": (m.group(2) or "").split(), "recipe": []})
+                    if first is None and not c.startswith("."):
+                        first = c
+                continue
+            if ln.startswith("\t") and cur:
+                for c in cur:
+                    rules[c]["recipe"].append(ln.strip().lstrip("@-+").strip())
+            elif ln.strip() and not ln.startswith("\t"):
+                cur = None
+        todo, done = list(targets or ([first] if first else [])), set()
+        while todo:
+            t = todo.pop()
+            if t in done or t not in rules:
+                continue
+            done.add(t)
+            out += [(r, os.path.basename(path) + ":" + t) for r in rules[t]["recipe"]]
+            todo += rules[t]["deps"]
+    return out
+
+
+def _package_scripts(cmd, cwd):
+    """Commands behind npm run X / npm test / yarn X / pnpm X / bun run X, read from package.json."""
+    out = []
+    for part in re.split(r"[;&|]+", cmd):
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            continue
+        if len(toks) < 2 or toks[0] not in ("npm", "yarn", "pnpm", "bun"):
+            continue
+        args = [t for t in toks[1:] if not t.startswith("-")]
+        if not args:
+            continue
+        if args[0] in ("run", "run-script") and len(args) > 1:
+            name = args[1]
+        elif args[0] in ("test", "start", "stop", "restart"):
+            name = args[0]
+        elif toks[0] in ("yarn", "pnpm") and args[0] not in ("add", "install", "remove", "dlx", "exec", "create"):
+            name = args[0]
+        else:
+            continue
+        path = os.path.join(cwd or os.getcwd(), "package.json")
+        try:
+            with open(path) as f:
+                scripts = json.load(f).get("scripts", {}) or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        for key in ("pre" + name, name, "post" + name):
+            if isinstance(scripts.get(key), str):
+                out.append((scripts[key], "package.json:" + key))
+    return out
 
 
 def _expand_vars(cmd):
@@ -309,6 +448,21 @@ def check(cmd, cwd=None, _depth=0):
                 v, rid, why = check(line, cwd, _depth + 1)
                 if v != ALLOW:
                     hits.append((rid, v, why + " (inside " + os.path.basename(path) + ")"))
+        for path in _program_files(norm, cwd):
+            try:
+                if os.path.getsize(path) > SCRIPT_MAX:
+                    hits.append(("script-too-big", ASK, "Program is too large to check: " + os.path.basename(path)))
+                    continue
+                with open(path, errors="replace") as f:
+                    body = f.read()
+            except OSError:
+                continue
+            if "\x00" not in body:
+                hits += _code_hits(body, os.path.basename(path), cwd, _depth, whole_file=True)
+        for line, where in _make_recipes(norm, cwd) + _package_scripts(norm, cwd):
+            v, rid, why = check(line, cwd, _depth + 1)
+            if v != ALLOW:
+                hits.append((rid, v, why + " (inside " + where + ")"))
     for rid, level, rx, why in RULES:
         if re.search(rx, scan, re.I):
             hits.append((rid, level, why))

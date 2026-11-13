@@ -11,6 +11,8 @@ Seatbelt checks every shell command an AI agent wants to run *before* it runs:
 
 One Python file. No dependencies.
 
+**New in v0.4:** [@NimadFlow](https://x.com/NimadFlow) asked the right question: what if the agent writes `rm -rf` into a file with the Write tool, then runs it a turn later? Shell scripts were already covered. Now Seatbelt also reads what runs behind `python3 cleanup.py`, `node wipe.js`, `make clean` (including its dependencies) and `npm run X` / `yarn X` (including `pre`/`post` hooks), and follows a dangerous path through a variable (`home = os.path.expanduser('~')` then `shutil.rmtree(home)`).
+
 **New in v0.3:** I asked Claude to attack v0.2 with 25 new tricks. 18 got through. Now all 25 are stopped, and 15 everyday commands still run untouched. Both lists live in `tests/` and run on every push: `find -delete`, commands hidden in variables, `echo "…" | sh`, `python3 - <<<`, emptying a database with `> prod.db`, `env | curl`, `chmod -R 000 ~`, `crontab -r`, `git push --mirror`, and more.
 
 **New in v0.2:** catches `python -c` / `node -e` one-liners that delete files, stops an agent from quietly switching Seatbelt off, a **shadow mode** to try rules without enforcing them, and `seatbelt stats`. Most of this came from people breaking v0.1 in the replies. Thank you. Works with **Claude Code** out of the box, and with any other agent through `seatbelt run`.
@@ -140,11 +142,11 @@ seatbelt rules
 Seatbelt is a seatbelt, not a crash-proof car.
 
 - **Fails closed.** If Seatbelt can't read or check a command (bad input, internal error), the hook denies it. A broken checker never means "allow".
-- **Looks inside wrappers.** `bash -c "…"`, `sh -c`, `eval`, `$(…)` and `base64 -d | sh` are unwrapped and checked. Local scripts the command runs (`bash x.sh`, `./x.sh`, `source x.sh`) are read and checked line by line. A script it can't read needs your approval.
+- **Looks inside wrappers.** `bash -c "…"`, `sh -c`, `eval`, `$(…)` and `base64 -d | sh` are unwrapped and checked. Local scripts the command runs (`bash x.sh`, `./x.sh`, `source x.sh`) are read and checked line by line, and so are program files (`python3 x.py`, `node x.js`, `ruby`, `perl`, `php`, `bun`, `deno run`), Makefile targets and `package.json` scripts. A script it can't read needs your approval.
 - **Catches script one-liners.** `python -c`, `node -e`, `ruby -e`, `perl -e` that delete files are flagged, and shell commands passed from inside them (`os.system("…")`) are checked too.
 - **Protects itself.** Edits to `.claude/settings.json` or `.seatbelt.json`, by Bash or by Claude Code's Edit/Write tools, need your approval.
 - **It is not a security boundary.** Seatbelt runs on the same machine, in the same trust domain as the agent. It's a seatbelt, not a circuit breaker. For a real boundary, run agents in a sandbox or container with no production credentials, and put anything that can delete, deploy or move money behind a separate service that has to say yes.
-- It still reads command text. A determined agent can hide intent in ways no text filter catches (a Python one-liner that deletes files, a script it writes and runs in two steps). Seatbelt catches the common, accidental disasters, not a deliberate attacker.
+- It still reads command text. A determined agent can hide intent in ways no text filter catches (code assembled at runtime, an imported module, a binary it compiles). Seatbelt catches the common, accidental disasters, not a deliberate attacker.
 - Use it **together with** backups, least-privilege credentials, and separate dev/prod access.
 - Found a dangerous command it misses, or a safe one it flags? Open an issue or a PR. Rules are plain regexes with tests.
 
